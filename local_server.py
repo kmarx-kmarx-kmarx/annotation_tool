@@ -1,4 +1,4 @@
-from dash import Dash, html, ctx
+from dash import Dash, html, ctx, dcc
 from dash.dependencies import Input, Output
 import plotly.express as px
 import pandas as pd
@@ -8,6 +8,10 @@ from itertools import islice
 import random
 import base64
 from itertools import islice
+import socket
+import uuid
+
+# note - this script cannot detect when a window is closed and can't unallocate memory for a user. thus, this script must be periodically closed and rerun.
 
 imgs_path = "./all_outs"
 imgs_type = "png"
@@ -19,6 +23,8 @@ random.seed(1)
 
 codes = {"INIT_CODE": -1, "POS_CODE": 1, "NEG_CODE":0, "UNSURE_CODE":9, "DUMMY": 999}
 
+# get ip to serve locally
+host = socket.gethostbyname(socket.gethostname())
 # define name generator
 def get_name(FOV_row, FOV_col, x, y):
     img_name = str(int(FOV_row))  + "_" + str(int(FOV_col)) + "_" + str(int(x)) + "_" + str(int(y))
@@ -57,17 +63,18 @@ def find_next_type(idx, idxs, code):
     c.execute('SELECT * FROM annotations')
     # store original idx
     idx_0 = idx
-    # skip to our index
-    next(islice(c, idxs[idx], None))
+    # look at nex index
+    idx += 1
+    row = list(next(islice(c, idxs[idx], None)))
+    stat = row[-1]
     while stat != code:
-        # go to next index
-        idx += 1
-        idx = idx % len(idxs)
         # if we looped back around, break
         if idx == idx_0:
             return idx
         # otherwise, read the next row and read its associated code
-        row = list(next(c))
+        c.execute('SELECT * FROM annotations')
+        idx += 1
+        row = list(next(islice(c, idxs[idx], None)))
         stat = row[-1]
     # close cursor and connection
     c.close()
@@ -116,87 +123,119 @@ else:
     spotlist.to_sql("annotations", con, if_exists='replace', index = False)
     con.commit()
 
-# Load initial (random) image
 # get number of rows
 c.execute('SELECT Count(*) FROM annotations')
 n_rows = list(next(c))[0]
 indices = list(range(int(n_rows)))
-random.shuffle(indices)
-i = 0
-seen_images = []
-seen_images.append(i)
 # done with this cursor
 c.close()
 con.close()
 
-caption, encoded_image = data_at_index(indices[i])
-new_log(f"Initialized first image: {caption}")
-logstring = log_to_string()
+# make empty dict to track who has seen what
+seen_images = {}
+user_indices = {} 
 
 # Build layout - image and buttons
-app.layout = html.Div([
-    html.Div(caption, id='image_status'),
-    html.Img(src='data:image/png;base64,{}'.format(encoded_image), id='image'),
-    html.Div([
-    html.Button(id='b_button_state', n_clicks=0, children='back'), # back
-    html.Button(id='p_button_state', n_clicks=0, children='positive'), # positive
-    html.Button(id='n_button_state', n_clicks=0, children='negative'), # negative
-    html.Button(id='u_button_state', n_clicks=0, children='unsure'), # unsure
-    html.Button(id='f_button_state', n_clicks=0, children='forward'), # forward
-    html.Button(id='s_button_state', n_clicks=0, children='skip')]),#skip
-    html.Div(logstring, id='log')
-])
+def serve_layout():
+    session_id = str(uuid.uuid4())
 
-def back_callback():
-    # track which log message we want
-    global i
-    flag = False
-    if len(seen_images) == 1:
-        new_log("Already at first image, can't go back")
+    return html.Div([
+        html.Div("Annotation Tool", id='image_status'),
+        html.Img(src='data:image/png;base64,{}', id='image'),
+        html.Div([
+            dcc.Store(data=session_id, id='session-id'),
+            html.Button(id='b_button_state', n_clicks=0, children='back'),     # back
+            html.Button(id='p_button_state', n_clicks=0, children='positive'), # positive
+            html.Button(id='n_button_state', n_clicks=0, children='negative'), # negative
+            html.Button(id='u_button_state', n_clicks=0, children='unsure'),   # unsure
+            html.Button(id='f_button_state', n_clicks=0, children='forward'),  # forward
+            html.Button(id='s_button_state', n_clicks=0, children='skip')      # skip
+        ]),
+        html.Div("Annotation Tool Log", id='log')
+    ])
+
+app.layout = serve_layout
+
+def do_nothing_callback(session_id):
+    global seen_images
+    global user_indices
+    caption, encoded_image = data_at_index(user_indices[session_id][seen_images[session_id][-1]])
+    return log_to_string(), caption, encoded_image
+
+def init_callback(session_id):
+    global seen_images
+    global user_indices
+
+    # check if we have initialized this user
+    if session_id in seen_images.keys():
+        return do_nothing_callback(session_id)
+    # otherwise, initialize indices 
     else:
-        seen_images.pop()
+        random.shuffle(indices)
+        user_indices[session_id] = indices.copy()
+        seen_images[session_id] = []
+        seen_images[session_id].append(0)
+        new_log(f"Initialized new user {session_id}")
+        return do_nothing_callback(session_id)
+
+
+def back_callback(session_id):
+    global seen_images
+    global user_indices
+    # track which log message we want
+    flag = False
+    if len(seen_images[session_id]) == 1:
+        new_log(f"{session_id} already at first image, can't go back")
+    else:
+        seen_images[session_id].pop()
         flag = True
     # target image is the last image in the list
-    i = seen_images[-1]
-    caption, encoded_image = data_at_index(indices[i])
+    i = seen_images[session_id][-1]
+    caption, encoded_image = data_at_index(user_indices[session_id][i])
     if flag:
-        new_log(f"Went back to previous image: {caption}")
+        new_log(f"{session_id} went back to previous image: {caption}")
     return log_to_string(), caption, encoded_image
 
-def fwd_callback():
-    global i
+def fwd_callback(session_id):
+    global seen_images
+    global user_indices
+    i = seen_images[session_id][-1]
     i += 1
-    i = i % len(indices)
-    seen_images.append(i)
-    caption, encoded_image = data_at_index(indices[i])
+    i = i % n_rows
+    seen_images[session_id].append(i)
+    caption, encoded_image = data_at_index(user_indices[session_id][i])
     
-    new_log(f"Went forward to next image: {caption}")
+    new_log(f"{session_id} went forward to next image: {caption}")
     return log_to_string(), caption, encoded_image
 
-def mark_callback(code):
-    global i
+def mark_callback(code, session_id):
+    global seen_images
+    global user_indices
+    i = seen_images[session_id][-1]
     # Mark this image
-    update_code(indices, i, code)
+    update_code(user_indices[session_id], i, code)
     # get image name
-    caption_old, __ = data_at_index(indices[i])
+    caption_old, __ = data_at_index(user_indices[session_id][i])
     i += 1
-    i = i % len(indices)
-    seen_images.append(i)
-    caption, encoded_image = data_at_index(indices[i])
-    new_log(f"Marked {caption_old}, moved to next image: {caption}")
+    i = i % n_rows
+    seen_images[session_id].append(i)
+    caption, encoded_image = data_at_index(user_indices[session_id][i])
+    new_log(f"{session_id} marked {caption_old}, moved to next image: {caption}")
     return log_to_string(), caption, encoded_image
 
-def skip_callback():
-    global i
-    i = find_next_type(i, indices, codes["INIT_CODE"])
-    seen_images.append(i)
-    caption, encoded_image = data_at_index(indices[i])
-    new_log(f"Went forward to next un-annotated: {caption}")
-    return log_to_string(), caption, encoded_image
-
-def do_nothing_callback():
-    global i
-    caption, encoded_image = data_at_index(indices[i])
+def skip_callback(session_id):
+    global seen_images
+    global user_indices
+    i = seen_images[session_id][-1]
+    i_new = find_next_type(i, user_indices[session_id], codes["INIT_CODE"])
+    if i == i_new:
+        new_log(f"{session_id} failed to find any more un-annotated images")
+        return do_nothing_callback(session_id)
+    else:
+        i = i_new
+    seen_images[session_id].append(i)
+    caption, encoded_image = data_at_index(user_indices[session_id][i])
+    new_log(f"{session_id} went forward to next un-annotated: {caption}")
     return log_to_string(), caption, encoded_image
 
 # Define button-handling callback - read from all the buttons and output to the image, log, and status
@@ -208,24 +247,25 @@ def do_nothing_callback():
               Input('n_button_state', 'n_clicks'),
               Input('u_button_state', 'n_clicks'),
               Input('f_button_state', 'n_clicks'),
-              Input('s_button_state', 'n_clicks'))
-def button_callback(b_btn, p_btn, n_btn, u_btn, f_btn, s_btn):
+              Input('s_button_state', 'n_clicks'),
+              Input('session-id', 'data'))
+def button_callback(b_btn, p_btn, n_btn, u_btn, f_btn, s_btn, session_id):
     button_id = ctx.triggered_id if not None else ' '
 
     if   button_id == "f_button_state":
-        return fwd_callback()
+        return fwd_callback(session_id)
     elif button_id == "u_button_state":
-        return mark_callback(codes['UNSURE_CODE'])
+        return mark_callback(codes['UNSURE_CODE'], session_id)
     elif button_id == "n_button_state":
-        return mark_callback(codes['NEG_CODE'])
+        return mark_callback(codes['NEG_CODE'], session_id)
     elif button_id == "p_button_state":
-        return mark_callback(codes['POS_CODE'])
+        return mark_callback(codes['POS_CODE'], session_id)
     elif button_id == "b_button_state":
-        return back_callback()
+        return back_callback(session_id)
     elif button_id == "s_button_state":
-        return skip_callback()
+        return skip_callback(session_id)
     else:
-        return do_nothing_callback()
-
+        return init_callback(session_id)
+    
 if __name__ == '__main__':
-    app.run_server(debug=True)
+    app.run_server(debug=True, host="10.34.181.228", port=8050)
